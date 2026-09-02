@@ -7,6 +7,7 @@ import time
 import subprocess
 import requests
 import re
+from datetime import datetime
 from seleniumbase import SB
 
 # 从环境变量获取账号密码和 TG 配置
@@ -1044,13 +1045,75 @@ def _read_page_text(sb, timeout=4):
             return ""
 
 
-def _classify_renew(alert_text, page_text):
+_STATIC_SERVER_TYPE_WARNING = (
+    "changing the server type will reset the startup command and environment variables"
+)
+
+
+def _extract_expiry_dates(text):
+    """Extract labelled expiry dates from page text, oldest occurrence first."""
+    text = text or ""
+    patterns = [
+        (r"\b\d{4}-\d{1,2}-\d{1,2}\b", ("%Y-%m-%d",)),
+        (r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b", ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%m-%d-%Y")),
+        (r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b",
+         ("%B %d, %Y", "%B %d %Y")),
+        (r"\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b",
+         ("%d %B %Y",)),
+    ]
+    labels = ("expir", "valid until", "due date", "end date")
+    found = []
+    for match_re, formats in patterns:
+        for m in re.finditer(match_re, text, re.IGNORECASE):
+            context = text[max(0, m.start() - 100):min(len(text), m.end() + 50)].lower()
+            if not any(label in context for label in labels):
+                continue
+            raw = m.group(0)
+            parsed = None
+            for fmt in formats:
+                try:
+                    parsed = datetime.strptime(raw, fmt).date()
+                    break
+                except ValueError:
+                    continue
+            if parsed and (parsed, raw) not in found:
+                found.append((parsed, raw))
+    return found
+
+
+def _new_cooldown_evidence(before_text, after_text):
+    """Return a newly appeared can't-renew sentence, if submission created one."""
+    sentence_re = re.compile(r"[^\n.!?]*(?:can't|cannot|unable to)\s+renew[^\n.!?]*[.!?]?", re.IGNORECASE)
+    before = {m.group(0).strip().lower() for m in sentence_re.finditer(before_text or "")}
+    for m in sentence_re.finditer(after_text or ""):
+        sentence = m.group(0).strip()
+        if sentence and sentence.lower() not in before:
+            return sentence
+    return ""
+
+
+def _classify_renew(alert_text, page_text, before_text=""):
     """权威归类续期结果，避免把假 success 当成功。
     成功判定需【renew/extension/renewal】+ 明确的 success/extend/complete/date 连语，
     不能只靠页面 body 里任一 `success` 子串（易误报）。返回 (status, detail)。
     detail 在成功时给到页面里的真实证据片段，避免只报 server-type 警告误导。"""
     body = (page_text or "") + "\n" + (alert_text or "")
     low = body.lower()
+
+    # Strongest proof: the persisted expiry date moved forward.
+    before_dates = _extract_expiry_dates(before_text)
+    after_dates = _extract_expiry_dates(body)
+    if before_dates and after_dates:
+        old_date, old_raw = max(before_dates)
+        new_date, new_raw = max(after_dates)
+        if new_date > old_date:
+            return RENEW_PASS, f"到期时间已更新: {old_raw} → {new_raw}"
+
+    # Some panel versions confirm renewal by replacing the Renew action with a
+    # newly generated cooldown message rather than showing a success alert.
+    new_cooldown = _new_cooldown_evidence(before_text, body)
+    if new_cooldown:
+        return RENEW_PASS, f"续期后进入冷却期: {new_cooldown}"
 
     # 成功：`renew...` 与 success/extend/complete/date 等紧邻（词级），且排除 suspended/冷却语境
     success_pat = re.compile(
@@ -1071,29 +1134,16 @@ def _classify_renew(alert_text, page_text):
         return RENEW_SUSPENDED, (alert_text or "服务器仍 suspended，续期未生效")
     if "can't renew" in low or "cannot renew" in low or "unable" in low:
         return RENEW_COOLDOWN, (alert_text or "未到续期时间/冷却中")
-    if "server type" in low and "startup command" in low and "reset" in low:
-        # 历史里这条是续期弹出在提交后被当成‘成功’的地址（实际未显示 success 文案）。
-        # 方案A：提交+ALT值已走完，页面只剩 server-type 警告而无显式 failure —— 且账号未到期时，
-        # 这属于“冷却期/已续”的正常情况，归为 cooldown(绿 ⏳)，不再把每天 schedule 标红；
-        # 只有检测到期日已在过去/剩余 0 天（真正逾期没续上）才保留红标（unconfirmed）让人工核对。
-        if "suspended" in low:
-            return RENEW_SUSPENDED, (alert_text or "服务器仍 suspended，续期未生效")
-        nd, n = _next_renewable(body)
-        overdue = False
-        if n is not None and n <= 0:
-            overdue = True
-        if nd is None and n is None:
-            # 文案没有给下次可续/剩余天数：视为已续或冷却的正常提交（账号健康场景）
-            return RENEW_COOLDOWN, (alert_text or "仅 server type 警告，无失败提示：视为已续/冷却")
-        if overdue:
-            return RENEW_UNCONFIRMED, (alert_text or "到期日已过/剩余 0 天，仍需人工核对续期")
-        extra = f"下次可续: {nd}" if nd else (f"{n} 天后" if n else "")
-        return RENEW_COOLDOWN, (alert_text or f"仅 server type 警告；下次可续 {extra}（冷却期，未到续期窗口）")
+    if _STATIC_SERVER_TYPE_WARNING in low:
+        # This alert belongs to the server-type form and is always present on
+        # the edit page. It is not a renewal response and must never prove
+        # success or cooldown by itself.
+        return RENEW_UNCONFIRMED, "只检测到服务器类型的静态警告，未找到续期成功证据"
     if alert_text:
         return RENEW_UNKNOWN, alert_text
     return RENEW_UNKNOWN, "未检测到明确提示"
 
-def _check_renew_result(sb):
+def _check_renew_result(sb, before_text=""):
     """读取提示，判定续期是否真生效。返回 (status, detail)。
     （不再在每个节点尝试内发 TG；由 main 对每个账号统一发一条汇总消息，避免冷却/失败时重复推送）"""
     print("\n📋 检查续期结果...")
@@ -1102,7 +1152,18 @@ def _check_renew_result(sb):
         time.sleep(3)
         alert_text = _read_alert(sb)
     page_text = _read_page_text(sb)
-    status, detail = _classify_renew(alert_text, page_text)
+    status, detail = _classify_renew(alert_text, page_text, before_text)
+    if status in (RENEW_UNKNOWN, RENEW_UNCONFIRMED):
+        # Reload once to verify persisted state. Transient success messages may
+        # vanish, but an advanced expiry date or cooldown state should remain.
+        try:
+            sb.refresh()
+            time.sleep(4)
+            page_text = _read_page_text(sb)
+            alert_text = _read_alert(sb)
+            status, detail = _classify_renew(alert_text, page_text, before_text)
+        except Exception as e:
+            print(f"⚠️ 重新加载验证续期状态失败: {e}")
     print(f"📩 页面提示: {detail}")
     return status, detail
 
@@ -1120,7 +1181,7 @@ def renew_server(sb):
     if not gs:
         return {"status": RENEW_UNKNOWN, "detail": "未能进入详情页"}
 
-    before = _read_page_text(sb)[:500]
+    before = _read_page_text(sb)
 
     if not _open_renew_modal(sb):
         return {"status": RENEW_UNKNOWN, "detail": "未弹 Renew 模态框"}
@@ -1130,7 +1191,7 @@ def renew_server(sb):
         print("⚠️ ALTCHA 验证未通过，仍尝试提交 Renew...")
 
     _submit_renew(sb)
-    status, detail = _check_renew_result(sb)
+    status, detail = _check_renew_result(sb, before)
     return {"status": status, "detail": detail, "before": before}
 
 
